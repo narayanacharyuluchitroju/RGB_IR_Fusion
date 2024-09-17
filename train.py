@@ -4,106 +4,36 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import matplotlib.pyplot as plt
-from sklearn.metrics import precision_recall_fscore_support
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 import xml.etree.ElementTree as ET
 import torchvision
+from load_dataset_rgb import DroneVehicleDataset
 
+def calculate_iou(pred_box, gt_box):
+    """Calculate Intersection over Union (IoU) between two bounding boxes."""
+    x1_max = max(pred_box[0], gt_box[0])
+    y1_max = max(pred_box[1], gt_box[1])
+    x2_min = min(pred_box[2], gt_box[2])
+    y2_min = min(pred_box[3], gt_box[3])
 
-class DroneVehicleDataset(Dataset):
-    def __init__(self, img_folder, label_folder, transform=None):
-        self.img_folder = img_folder
-        self.label_folder = label_folder
-        self.transform = transform
-        self.img_files = sorted(os.listdir(self.img_folder))
-        self.label_files = sorted(os.listdir(self.label_folder))
+    # Compute the area of intersection
+    inter_area = max(0, x2_min - x1_max) * max(0, y2_min - y1_max)
 
-        # Filter out images without bounding boxes during initialization
-        self.filtered_files = self.filter_empty_images()
+    # Compute the area of both boxes
+    pred_box_area = (pred_box[2] - pred_box[0]) * (pred_box[3] - pred_box[1])
+    gt_box_area = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
 
-    def __len__(self):
-        return len(self.filtered_files)
+    # Compute the area of union
+    union_area = pred_box_area + gt_box_area - inter_area
 
-    def filter_empty_images(self):
-        """Filter out images that do not have any bounding boxes."""
-        filtered_files = []
-        for img_file, label_file in zip(self.img_files, self.label_files):
-            label_path = os.path.join(self.label_folder, label_file)
-            boxes, _ = self.parse_annotation(label_path)
-            if len(boxes) > 0:  # Only keep images with at least one bounding box
-                filtered_files.append((img_file, label_file))
-        return filtered_files
+    # Compute IoU
+    iou = inter_area / union_area if union_area > 0 else 0
 
-    def parse_annotation(self, label_path):
-        tree = ET.parse(label_path)
-        root = tree.getroot()
-
-        boxes = []
-        labels = []
-
-        for obj in root.findall('object'):
-            name = obj.find('name').text.lower()  # Lowercase for consistency
-
-            bndbox = obj.find('bndbox')
-            if bndbox is not None:
-                try:
-                    x_min = int(bndbox.find('xmin').text) - 100
-                    y_min = int(bndbox.find('ymin').text) - 100
-                    x_max = int(bndbox.find('xmax').text) - 100
-                    y_max = int(bndbox.find('ymax').text) - 100
-                except AttributeError as e:
-                    print(f"Warning: Missing xmin/xmax/ymin/ymax in {label_path}: {e}")
-                    continue
-                boxes.append([x_min, y_min, x_max, y_max])
-
-                # Map label names to integers based on the five categories
-                if name == 'car':
-                    labels.append(1)
-                elif name == 'truck':
-                    labels.append(2)
-                elif name == 'bus':
-                    labels.append(3)
-                elif name == 'van':
-                    labels.append(4)
-                elif name == 'feright car':
-                    labels.append(5)
-                else:
-                    labels.append(0)  # Unknown class or ignore
-                    print(f"Warning: Unknown class '{name}' in {label_path}")
-
-        return boxes, labels
-
-    def __getitem__(self, idx):
-        img_file, label_file = self.filtered_files[idx]
-        img_path = os.path.join(self.img_folder, img_file)
-        label_path = os.path.join(self.label_folder, label_file)
-
-        img = Image.open(img_path).convert("RGB")
-
-        # Crop the image to remove the 100-pixel border on all sides (top, bottom, left, right)
-        width, height = img.size
-        img = img.crop((100, 100, width - 100, height - 100))  # Adjust crop dynamically
-
-        boxes, labels = self.parse_annotation(label_path)
-
-        # Convert boxes and labels to tensors
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-
-        target = {}
-        target["boxes"] = boxes
-        target["labels"] = labels
-
-        # Apply transformations (make sure ToTensor is included)
-        if self.transform:
-            img = self.transform(img)
-
-        return img, target
-
+    return iou
 
 # Define the model
 def get_model(num_classes):
-    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
@@ -138,6 +68,9 @@ model.to(device)
 params = [p for p in model.parameters() if p.requires_grad]
 optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
 
+# IoU threshold for true positives
+iou_threshold = 0.5
+
 # Training loop
 num_epochs = 10
 train_losses_per_epoch = []
@@ -167,9 +100,11 @@ for epoch in range(num_epochs):
     train_losses_per_epoch.append(avg_train_loss)
     print(f"Epoch [{epoch + 1}/{num_epochs}], Training Loss: {avg_train_loss}")
 
-    # Validation phase (no loss calculation, just prediction and metrics)
+    # Validation phase (IoU-based evaluation)
     model.eval()
-    all_image_metrics = []  # Store precision, recall, f1 per image
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
 
     with torch.no_grad():
         for images, targets in val_loader:
@@ -179,25 +114,33 @@ for epoch in range(num_epochs):
             # Forward pass for predictions (no loss)
             outputs = model(images)
 
-            # Collect predictions and labels for metrics
             for i, output in enumerate(outputs):
+                pred_boxes = output['boxes'].cpu().numpy()
                 pred_labels = output['labels'].cpu().numpy()
+                true_boxes = targets[i]['boxes'].cpu().numpy()
                 true_labels = targets[i]['labels'].cpu().numpy()
 
-                if len(true_labels) > 0:  # Only compute metrics for non-empty ground truth
-                    precision, recall, f1, _ = precision_recall_fscore_support(true_labels, pred_labels,
-                                                                               average='macro', zero_division=0)
-                    all_image_metrics.append((precision, recall, f1))
+                for pred_box in pred_boxes:
+                    best_iou = 0
+                    for true_box in true_boxes:
+                        iou = calculate_iou(pred_box, true_box)
+                        if iou > best_iou:
+                            best_iou = iou
 
-    # Calculate average precision, recall, and F1 over all images
-    if all_image_metrics:
-        avg_precision = sum(x[0] for x in all_image_metrics) / len(all_image_metrics)
-        avg_recall = sum(x[1] for x in all_image_metrics) / len(all_image_metrics)
-        avg_f1 = sum(x[2] for x in all_image_metrics) / len(all_image_metrics)
+                    if best_iou >= iou_threshold:
+                        true_positives += 1
+                    else:
+                        false_positives += 1
 
-        print(f"Validation - Precision: {avg_precision:.4f}, Recall: {avg_recall:.4f}, F1 Score: {avg_f1:.4f}")
-    else:
-        print(f"No valid predictions for validation metrics in epoch {epoch + 1}")
+                # Count false negatives (ground truth boxes without matching predictions)
+                false_negatives += len(true_boxes) - true_positives
+
+    # Calculate precision, recall, and F1 score
+    precision = true_positives / (true_positives + false_positives + 1e-6)
+    recall = true_positives / (true_positives + false_negatives + 1e-6)
+    f1_score = 2 * (precision * recall) / (precision + recall + 1e-6)
+
+    print(f"Validation - Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1_score:.4f}")
 
     # Save the model
     model_save_path = os.path.join('saved_models', f'faster_rcnn_epoch_{epoch + 1}.pth')

@@ -36,6 +36,10 @@ def calculate_iou(pred_box, gt_box):
 # Define the model
 def get_model(num_classes):
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+
+    # Modify the first convolutional layer to accept 1-channel (grayscale) images instead of 3-channel RGB
+    model.backbone.body.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
@@ -49,8 +53,9 @@ val_label_dir = 'val/vallabel'
 
 # Define transformations, including ToTensor
 transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),  # Convert image to grayscale (1 channel)
     transforms.ToTensor(),  # Convert PIL Image to PyTorch Tensor
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize (for RGB images)
+    transforms.Normalize(mean=[0.5], std=[0.5])  # Normalize (for grayscale images)
 ])
 
 # Dataset class
@@ -64,7 +69,7 @@ val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=lam
 num_classes = 6  # Background + 5 vehicle types
 model = get_model(num_classes)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('Device: ',device)
+print('Device: ', device)
 model.to(device)
 
 # Optimizer
